@@ -5,12 +5,16 @@
 #define DR_WAV_IMPLEMENTATION
 #include "dr_wav.h"
 
+#include "nlohmann/json.hpp"
+
 #include <cmath>
 #include <fstream>
 #include <cstdio>
 #include <string>
 #include <thread>
 #include <vector>
+
+using json = nlohmann::json;
 
 // Terminal color map. 10 colors grouped in ranges [0.0, 0.1, ..., 0.9]
 // Lowest is red, middle is yellow, highest is green.
@@ -74,6 +78,7 @@ struct whisper_params {
     bool output_srt     = false;
     bool output_wts     = false;
     bool output_csv     = false;
+    bool output_json    = false;
     bool print_special  = false;
     bool print_colors   = false;
     bool print_progress = false;
@@ -122,6 +127,7 @@ bool whisper_params_parse(int argc, char ** argv, whisper_params & params) {
         else if (arg == "-osrt" || arg == "--output-srt")     { params.output_srt     = true; }
         else if (arg == "-owts" || arg == "--output-words")   { params.output_wts     = true; }
         else if (arg == "-ocsv" || arg == "--output-csv")     { params.output_csv     = true; }
+        else if (arg == "-ojson" || arg == "--output-json")     { params.output_json     = true; }
         else if (arg == "-of"   || arg == "--output-file")    { params.fname_outp.emplace_back(argv[++i]); }
         else if (arg == "-ps"   || arg == "--print-special")  { params.print_special  = true; }
         else if (arg == "-pc"   || arg == "--print-colors")   { params.print_colors   = true; }
@@ -167,6 +173,7 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "  -osrt,     --output-srt        [%-7s] output result in a srt file\n",                    params.output_srt ? "true" : "false");
     fprintf(stderr, "  -owts,     --output-words      [%-7s] output script for generating karaoke video\n",     params.output_wts ? "true" : "false");
     fprintf(stderr, "  -ocsv,     --output-csv        [%-7s] output result in a CSV file\n",                    params.output_csv ? "true" : "false");
+    fprintf(stderr, "  -ojson,    --output-json       [%-7s] output result in JSON format to stdout\n",         params.output_json ? "true" : "false");
     fprintf(stderr, "  -of FNAME, --output-file FNAME [%-7s] output file path (without file extension)\n",      "");
     fprintf(stderr, "  -ps,       --print-special     [%-7s] print special tokens\n",                           params.print_special ? "true" : "false");
     fprintf(stderr, "  -pc,       --print-colors      [%-7s] print colors\n",                                   params.print_colors ? "true" : "false");
@@ -356,6 +363,64 @@ bool output_csv(struct whisper_context * ctx, const char * fname) {
         fout << 10 * t0 << ", " << 10 * t1 << ", \"" << text    << "\"\n";
     }
 
+    return true;
+}
+
+
+// output json to console
+bool output_json(struct whisper_context * ctx) {
+    json json_object;
+    json segment_array = json::array();
+
+    printf("__START_JSON_OUTPUT__\n");
+
+    for (int i = 0; i < whisper_full_n_segments(ctx); i++) {
+        const int64_t t0 = whisper_full_get_segment_t0(ctx, i);
+        const int64_t t1 = whisper_full_get_segment_t1(ctx, i);
+
+        const int n = whisper_full_n_tokens(ctx, i);
+
+        json token_array = json::array();
+
+        std::vector<whisper_token_data> tokens(n);
+        for (int j = 0; j < n; ++j) {
+            tokens[j] = whisper_full_get_token_data(ctx, i, j);
+
+            if (tokens[j].id >= whisper_token_eot(ctx)) {
+                continue;
+            }
+
+            json token_json = {
+                {"start_time", tokens[j].t0/100.0},
+                {"end_time", tokens[j].t1/100.0},
+                {"text", whisper_token_to_str(ctx, tokens[j].id)},
+                {"p", tokens[j].p},
+                {"pt", tokens[j].pt},
+                {"plog", tokens[j].plog},
+                {"ptsum", tokens[j].ptsum}
+            };
+            token_array[token_array.size()] = token_json;
+        }
+
+        const char * segment_text = whisper_full_get_segment_text(ctx, i);
+        if (segment_text[0] == ' ') {
+            segment_text = segment_text + sizeof(char); //whisper_full_get_segment_text() returns a string with leading space, point to the next character.
+        }
+
+        json segment = {
+            {"start_time", t0 / 100.0},
+            {"end_time", t1 / 100.0},
+            {"text", segment_text},
+            {"tokens", token_array}
+        };
+
+        segment_array[i] = segment;
+
+    }
+    std::string serialized_string = segment_array.dump();
+    printf("%s\n", serialized_string.c_str());
+
+    printf("__END_JSON_OUTPUT__\n");
     return true;
 }
 
@@ -648,7 +713,7 @@ int main(int argc, char ** argv) {
             wparams.offset_ms        = params.offset_t_ms;
             wparams.duration_ms      = params.duration_ms;
 
-            wparams.token_timestamps = params.output_wts || params.max_len > 0;
+            wparams.token_timestamps = params.output_wts || params.output_json || params.max_len > 0;
             wparams.thold_pt         = params.word_thold;
             wparams.entropy_thold    = params.entropy_thold;
             wparams.logprob_thold    = params.logprob_thold;
@@ -665,7 +730,7 @@ int main(int argc, char ** argv) {
             whisper_print_user_data user_data = { &params, &pcmf32s };
 
             // this callback is called on each new segment
-            if (!wparams.print_realtime) {
+            if (!wparams.print_realtime && !params.output_json) {
                 wparams.new_segment_callback           = whisper_print_segment_callback;
                 wparams.new_segment_callback_user_data = &user_data;
             }
@@ -717,12 +782,16 @@ int main(int argc, char ** argv) {
                 output_wts(ctx, fname_wts.c_str(), fname_inp.c_str(), params, float(pcmf32.size() + 1000)/WHISPER_SAMPLE_RATE);
             }
 
-	    // output to CSV file
+            // output to CSV file
             if (params.output_csv) {
                 const auto fname_csv = fname_outp + ".csv";
                 output_csv(ctx, fname_csv.c_str());
             }
-
+            
+            // output JSON to stdout
+            if (params.output_json) {
+                output_json(ctx);
+            }
         }
     }
 
