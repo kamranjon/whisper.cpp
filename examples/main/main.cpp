@@ -417,7 +417,10 @@ bool output_json(struct whisper_context * ctx) {
         segment_array[i] = segment;
 
     }
-    std::string serialized_string = segment_array.dump();
+
+    json_object["language"] = whisper_lang_str(whisper_full_lang_id(ctx));
+    json_object["segments"] = segment_array;
+    std::string serialized_string = json_object.dump(-1, ' ', false, json::error_handler_t::ignore);
     printf("%s\n", serialized_string.c_str());
 
     printf("__END_JSON_OUTPUT__\n");
